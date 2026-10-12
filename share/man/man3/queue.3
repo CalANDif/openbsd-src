@@ -1160,6 +1160,45 @@ Using any macro (except the various forms of insertion) on an element
 removed from a list or queue is incorrect.
 An example of erroneous usage is removing the same element twice.
 .Pp
+If the preprocessor symbol
+.Dv QUEUE_MACRO_DEBUG
+is defined, the next and previous fields of a
+.Nm LIST
+or
+.Nm TAILQ
+element are overwritten with
+.Dv _Q_INVALID
+after it is removed, so that a subsequent erroneous use of the stale
+element faults instead of silently corrupting memory.
+.Pp
+If the preprocessor symbol
+.Dv QUEUE_MACRO_ASSERT
+is defined, the
+.Nm LIST
+and
+.Nm TAILQ
+insert, remove and replace macros additionally verify, before writing
+through any link field, that the element's previous pointer refers to a
+slot that in turn points back at the element, and that its next element
+(if any) points back at it.
+These invariants hold for every element on a well-formed list; a
+corrupted link field almost certainly violates them.
+When a check fails the macro calls
+.Xr abort 3
+rather than performing an attacker-controlled write.
+A removed (poisoned) element is likewise detected and rejected.
+Code that defines
+.Dv QUEUE_MACRO_ASSERT
+must have
+.Xr abort 3
+in scope at every macro expansion site.
+In the kernel both behaviours are enabled under
+.Cd option DIAGNOSTIC ,
+with
+.Xr panic 9
+in place of
+.Xr abort 3 .
+.Pp
 The
 .Fn SLIST_END ,
 .Fn LIST_END ,

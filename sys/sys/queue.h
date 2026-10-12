@@ -36,6 +36,7 @@
 #define	_SYS_QUEUE_H_
 
 #include <sys/_null.h>
+#include <sys/cdefs.h>
 
 /*
  * This file defines five types of data structures: singly-linked lists,
@@ -81,12 +82,109 @@
  * For details on the use of these macros, see the queue(3) manual page.
  */
 
-#if defined(QUEUE_MACRO_DEBUG) || (defined(_KERNEL) && defined(DIAGNOSTIC))
+/*
+ * _Q_INVALID is the poison value written into link fields after an element
+ * is removed.  It is always defined so that code may compare against it,
+ * but _Q_INVALIDATE() -- which performs the poisoning -- is only enabled
+ * under QUEUE_MACRO_DEBUG or in DIAGNOSTIC kernels.
+ */
 #define _Q_INVALID ((void *)-1)
+
+#if defined(QUEUE_MACRO_DEBUG) || (defined(_KERNEL) && defined(DIAGNOSTIC))
 #define _Q_INVALIDATE(a) (a) = _Q_INVALID
 #else
 #define _Q_INVALIDATE(a)
 #endif
+
+/*
+ * Safe-unlinking consistency checks.
+ *
+ * The LIST and TAILQ remove / replace / insert operations write through
+ * elm->prev and elm->next.  If an attacker has corrupted those fields (via
+ * heap overflow, use-after-free, type confusion, etc.) the macros become a
+ * write-what-where primitive.  Under QUEUE_MACRO_ASSERT, or in DIAGNOSTIC
+ * kernels, verify before any store that:
+ *
+ *     *elm->prev == elm
+ *     elm->next == NULL || elm->next->prev == &elm->next
+ *
+ * A forged prev/next almost certainly fails these invariants, converting a
+ * controlled arbitrary write into a controlled fail-stop.  The checks are
+ * read-only up to the panic/abort and compile out entirely when disabled.
+ *
+ * panic() / abort() need only be in scope at the macro expansion site, so
+ * this header gains no additional #include dependencies.
+ */
+#if defined(QUEUE_MACRO_ASSERT) || (defined(_KERNEL) && defined(DIAGNOSTIC))
+
+#ifdef _KERNEL
+#define _Q_PANIC(msg, elm)						\
+	panic("queue: " msg ": %p", (void *)(elm))
+#else
+#define _Q_PANIC(msg, elm)	do { (void)(elm); abort(); } while (0)
+#endif
+
+#define _Q_ASSERT(cond, msg, elm) do {					\
+	if (__predict_false(!(cond)))					\
+		_Q_PANIC(msg, (elm));					\
+} while (0)
+
+/*
+ * *(elm->prev) must point back at elm.
+ *
+ * All link-identity comparisons go through (const void *) because some
+ * callers insert a type-punned "iterator" or "cursor" structure onto a
+ * list declared for a different struct type (see e.g. net/pipex.c,
+ * net/if.c).  The underlying pointer values coincide; only the C types
+ * differ.
+ */
+#define _Q_CHECK_PREV(elm, field, pfx)					\
+	_Q_ASSERT((const void *)*(elm)->field.pfx##_prev ==		\
+	    (const void *)(elm),					\
+	    #pfx " *elm->prev != elm", (elm))
+
+/* elm->next, if non-NULL, must have its prev pointing at &elm->next. */
+#define _Q_CHECK_NEXT(elm, field, pfx)					\
+	_Q_ASSERT((elm)->field.pfx##_next == NULL ||			\
+	    (const void *)(elm)->field.pfx##_next->field.pfx##_prev ==	\
+	        (const void *)&(elm)->field.pfx##_next,			\
+	    #pfx " elm->next->prev != &elm->next", (elm))
+
+/* elm must not already have been removed (poisoned). */
+#define _Q_CHECK_LIVE(elm, field, pfx)					\
+	_Q_ASSERT((const void *)(elm)->field.pfx##_prev != _Q_INVALID,	\
+	    #pfx " double remove", (elm))
+
+/* LIST head: lh_first, if non-NULL, must point back at &head->lh_first. */
+#define _Q_CHECK_HEAD_LH(head, field)					\
+	_Q_ASSERT((head)->lh_first == NULL ||				\
+	    (const void *)(head)->lh_first->field.le_prev ==		\
+	        (const void *)&(head)->lh_first,			\
+	    "list head->first->prev != &head->first", (head))
+
+/* TAILQ head: tqh_first, if non-NULL, must point back at &head->tqh_first. */
+#define _Q_CHECK_HEAD_TQ(head, field)					\
+	_Q_ASSERT((head)->tqh_first == NULL ||				\
+	    (const void *)(head)->tqh_first->field.tqe_prev ==		\
+	        (const void *)&(head)->tqh_first,			\
+	    "tailq head->first->prev != &head->first", (head))
+
+/* TAILQ head: *tqh_last (the tail element's tqe_next) must be NULL. */
+#define _Q_CHECK_TAIL_TQ(head)						\
+	_Q_ASSERT(*(head)->tqh_last == NULL,				\
+	    "tailq *head->last != NULL", (head))
+
+#else /* !QUEUE_MACRO_ASSERT && !(_KERNEL && DIAGNOSTIC) */
+
+#define _Q_ASSERT(cond, msg, elm)	((void)0)
+#define _Q_CHECK_PREV(elm, field, pfx)	((void)0)
+#define _Q_CHECK_NEXT(elm, field, pfx)	((void)0)
+#define _Q_CHECK_LIVE(elm, field, pfx)	((void)0)
+#define _Q_CHECK_HEAD_LH(head, field)	((void)0)
+#define _Q_CHECK_HEAD_TQ(head, field)	((void)0)
+#define _Q_CHECK_TAIL_TQ(head)		((void)0)
+
+#endif /* QUEUE_MACRO_ASSERT || (_KERNEL && DIAGNOSTIC) */
 
 /*
  * Singly-linked List definitions.
@@ -204,6 +302,7 @@ struct {								\
 } while (0)
 
 #define LIST_INSERT_AFTER(listelm, elm, field) do {			\
+	_Q_CHECK_NEXT((listelm), field, le);				\
 	if (((elm)->field.le_next = (listelm)->field.le_next) != NULL)	\
 		(listelm)->field.le_next->field.le_prev =		\
 		    &(elm)->field.le_next;				\
@@ -212,6 +311,7 @@ struct {								\
 } while (0)
 
 #define	LIST_INSERT_BEFORE(listelm, elm, field) do {			\
+	_Q_CHECK_PREV((listelm), field, le);				\
 	(elm)->field.le_prev = (listelm)->field.le_prev;		\
 	(elm)->field.le_next = (listelm);				\
 	*(listelm)->field.le_prev = (elm);				\
@@ -219,6 +319,7 @@ struct {								\
 } while (0)
 
 #define LIST_INSERT_HEAD(head, elm, field) do {				\
+	_Q_CHECK_HEAD_LH((head), field);				\
 	if (((elm)->field.le_next = (head)->lh_first) != NULL)		\
 		(head)->lh_first->field.le_prev = &(elm)->field.le_next;\
 	(head)->lh_first = (elm);					\
@@ -226,6 +327,9 @@ struct {								\
 } while (0)
 
 #define LIST_REMOVE(elm, field) do {					\
+	_Q_CHECK_LIVE((elm), field, le);				\
+	_Q_CHECK_PREV((elm), field, le);				\
+	_Q_CHECK_NEXT((elm), field, le);				\
 	if ((elm)->field.le_next != NULL)				\
 		(elm)->field.le_next->field.le_prev =			\
 		    (elm)->field.le_prev;				\
@@ -235,6 +339,9 @@ struct {								\
 } while (0)
 
 #define LIST_REPLACE(elm, elm2, field) do {				\
+	_Q_CHECK_LIVE((elm), field, le);				\
+	_Q_CHECK_PREV((elm), field, le);				\
+	_Q_CHECK_NEXT((elm), field, le);				\
 	if (((elm2)->field.le_next = (elm)->field.le_next) != NULL)	\
 		(elm2)->field.le_next->field.le_prev =			\
 		    &(elm2)->field.le_next;				\
@@ -468,6 +575,7 @@ struct {								\
 } while (0)
 
 #define TAILQ_INSERT_HEAD(head, elm, field) do {			\
+	_Q_CHECK_HEAD_TQ((head), field);				\
 	if (((elm)->field.tqe_next = (head)->tqh_first) != NULL)	\
 		(head)->tqh_first->field.tqe_prev =			\
 		    &(elm)->field.tqe_next;				\
@@ -478,6 +586,7 @@ struct {								\
 } while (0)
 
 #define TAILQ_INSERT_TAIL(head, elm, field) do {			\
+	_Q_CHECK_TAIL_TQ((head));					\
 	(elm)->field.tqe_next = NULL;					\
 	(elm)->field.tqe_prev = (head)->tqh_last;			\
 	*(head)->tqh_last = (elm);					\
@@ -485,6 +594,7 @@ struct {								\
 } while (0)
 
 #define TAILQ_INSERT_AFTER(head, listelm, elm, field) do {		\
+	_Q_CHECK_NEXT((listelm), field, tqe);				\
 	if (((elm)->field.tqe_next = (listelm)->field.tqe_next) != NULL)\
 		(elm)->field.tqe_next->field.tqe_prev =			\
 		    &(elm)->field.tqe_next;				\
@@ -495,6 +605,7 @@ struct {								\
 } while (0)
 
 #define	TAILQ_INSERT_BEFORE(listelm, elm, field) do {			\
+	_Q_CHECK_PREV((listelm), field, tqe);				\
 	(elm)->field.tqe_prev = (listelm)->field.tqe_prev;		\
 	(elm)->field.tqe_next = (listelm);				\
 	*(listelm)->field.tqe_prev = (elm);				\
@@ -502,6 +613,9 @@ struct {								\
 } while (0)
 
 #define TAILQ_REMOVE(head, elm, field) do {				\
+	_Q_CHECK_LIVE((elm), field, tqe);				\
+	_Q_CHECK_PREV((elm), field, tqe);				\
+	_Q_CHECK_NEXT((elm), field, tqe);				\
 	if (((elm)->field.tqe_next) != NULL)				\
 		(elm)->field.tqe_next->field.tqe_prev =			\
 		    (elm)->field.tqe_prev;				\
@@ -513,6 +627,9 @@ struct {								\
 } while (0)
 
 #define TAILQ_REPLACE(head, elm, elm2, field) do {			\
+	_Q_CHECK_LIVE((elm), field, tqe);				\
+	_Q_CHECK_PREV((elm), field, tqe);				\
+	_Q_CHECK_NEXT((elm), field, tqe);				\
 	if (((elm2)->field.tqe_next = (elm)->field.tqe_next) != NULL)	\
 		(elm2)->field.tqe_next->field.tqe_prev =		\
 		    &(elm2)->field.tqe_next;				\
@@ -526,6 +643,8 @@ struct {								\
 
 #define TAILQ_CONCAT(head1, head2, field) do {				\
 	if (!TAILQ_EMPTY(head2)) {					\
+		_Q_CHECK_TAIL_TQ((head1));				\
+		_Q_CHECK_HEAD_TQ((head2), field);			\
 		*(head1)->tqh_last = (head2)->tqh_first;		\
 		(head2)->tqh_first->field.tqe_prev = (head1)->tqh_last;	\
 		(head1)->tqh_last = (head2)->tqh_last;			\
