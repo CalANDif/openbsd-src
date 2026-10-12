@@ -85,9 +85,8 @@
  * pmaps has been removed, though, because it performs badly on SMP
  * systems.
  * The most obvious difference to i386 is that 2 extra levels of page
- * table need to be dealt with. The level 1 page table pages are at:
- *
- * l1: 0x00007f8000000000 - 0x00007fffffffffff     (39 bits, needs PML4 entry)
+ * table need to be dealt with. The level 1 page table pages occupy one
+ * randomly selected PML4 slot (512 GB) in the recursive mapping window.
  *
  * The other levels are kept as physical pages in 3 UVM objects and are
  * temporarily mapped for virtual access when needed.
@@ -104,13 +103,15 @@
  *  |      Direct Map Window          |
  *  +---------------------------------+ 0xffffee0000000000
  *  ~                                 ~
+ *  +---------------------------------+ 0xffffe00000000000
+ *  |    Recursive Mapping Window     |
+ *  +---------------------------------+ 0xffffa00000000000
+ *  ~                                 ~
  *  |                                 |
  *  |         Kernel Space            |
  *  |                                 |
  *  |                                 |
  *  +---------------------------------+ 0xffff800000000000 = 0x0000800000000000
- *  |    L1 table (PTE pages)         |
- *  +---------------------------------+ 0x00007f8000000000
  *  ~                                 ~
  *  |                                 |
  *  |         User Space              |
@@ -136,7 +137,11 @@
  */
 #define VA_SIGN_POS(va)		((va) & ~VA_SIGN_MASK)
 
-#define L4_SLOT_PTE			255
+/* One boot-wide slot, selected by locore from loader-supplied randomness. */
+#define PTE_SLOT_MIN			320
+#define PTE_SLOT_CHOICES		128
+#define PTE_SLOT_MASK			(PTE_SLOT_CHOICES - 1)
+#define L4_SLOT_PTE			pmap_pte_slot
 #define L4_SLOT_KERN			256
 #define L4_SLOT_KERNBASE		511
 #define DIRECT_MAP_PML4_SLOTS		4
@@ -153,6 +158,13 @@
 #error DIRECT_MAP_START_CHOICES must be a power of two
 #endif
 
+#if (PTE_SLOT_CHOICES & PTE_SLOT_MASK) != 0
+#error PTE_SLOT_CHOICES must be a power of two
+#endif
+#if PTE_SLOT_MIN < 256 || PTE_SLOT_MIN + PTE_SLOT_CHOICES > L4_SLOT_EARLY
+#error recursive mapping window must be in the unused upper half
+#endif
+
 #define PDIR_SLOT_KERN		L4_SLOT_KERN
 #define PDIR_SLOT_PTE		L4_SLOT_PTE
 #define PDIR_SLOT_DIRECT	L4_SLOT_DIRECT
@@ -166,7 +178,8 @@
  *
  */
 
-#define PTE_BASE  ((pt_entry_t *) (L4_SLOT_PTE * NBPD_L4))
+#define PTE_BASE  ((pt_entry_t *)VA_SIGN_NEG((vaddr_t)L4_SLOT_PTE * NBPD_L4))
+extern int pmap_pte_slot;
 extern vaddr_t pmap_direct_base, pmap_direct_end;
 
 #define L1_BASE		PTE_BASE
@@ -232,7 +245,6 @@ extern vaddr_t pmap_direct_base, pmap_direct_end;
 #define NKPTPMAX_INITIALIZER	{ NKL1_MAX_ENTRIES, NKL2_MAX_ENTRIES, \
 				  NKL3_MAX_ENTRIES, NKL4_MAX_ENTRIES }
 #define NBPD_INITIALIZER	{ NBPD_L1, NBPD_L2, NBPD_L3, NBPD_L4 }
-#define PDES_INITIALIZER	{ L2_BASE, L3_BASE, L4_BASE }
 
 /*
  * PTP macros:

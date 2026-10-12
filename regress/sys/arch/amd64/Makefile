@@ -4,6 +4,7 @@
 SUBDIR +=	ddb
 SUBDIR +=	dump_tables
 SUBDIR +=	fpu
+SUBDIR +=	pte_layout
 SUBDIR +=	seves_mmio
 SUBDIR +=	vmcall
 SUBDIR +=	vmmcall

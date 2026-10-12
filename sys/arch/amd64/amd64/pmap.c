@@ -212,7 +212,7 @@ const vaddr_t ptp_masks[] = PTP_MASK_INITIALIZER;
 const int ptp_shifts[] = PTP_SHIFT_INITIALIZER;
 const long nkptpmax[] = NKPTPMAX_INITIALIZER;
 const long nbpd[] = NBPD_INITIALIZER;
-pd_entry_t *const normal_pdes[] = PDES_INITIALIZER;
+pd_entry_t *normal_pdes[PTP_LEVELS - 1];
 
 #define pmap_pte_set(p, n)		atomic_swap_64(p, n)
 #define pmap_pte_clearbits(p, b)	x86_atomic_clearbits_u64(p, b)
@@ -221,6 +221,8 @@ pd_entry_t *const normal_pdes[] = PDES_INITIALIZER;
 vaddr_t pmap_direct_base;
 vaddr_t pmap_direct_end;
 char pmap_direct_rand __attribute((section(".openbsd.randomdata")));
+int pmap_pte_slot;
+char pmap_pte_rand __attribute((section(".openbsd.randomdata")));
 
 /*
  * global data structures
@@ -670,6 +672,14 @@ pmap_bootstrap(paddr_t first_avail, paddr_t max_pa)
 	paddr_t dmpd, dmpdp, start_cur, cur_pa;
 	vaddr_t kva, kva_end;
 	pt_entry_t *pml3, *pml2;
+
+	KASSERT(pmap_pte_slot >= PTE_SLOT_MIN &&
+	    pmap_pte_slot < PTE_SLOT_MIN + PTE_SLOT_CHOICES);
+	CTASSERT(L4_SLOT_KERN + NKL4_MAX_ENTRIES <= PTE_SLOT_MIN);
+	CTASSERT(VM_MAX_KERNEL_ADDRESS <= VA_SIGN_NEG(PTE_SLOT_MIN * NBPD_L4));
+	normal_pdes[0] = L2_BASE;
+	normal_pdes[1] = L3_BASE;
+	normal_pdes[2] = L4_BASE;
 
 	KASSERT(((0x1000ULL | pg_crypt) & pg_frame) == 0x1000ULL);
 
@@ -1320,11 +1330,7 @@ pmap_pdp_ctor(pd_entry_t *pdir)
 	/* fetch the physical address of the page directory. */
 	(void) pmap_extract(kpm, (vaddr_t) pdir, &pdirpa);
 
-	/* zero init area */
-	memset(pdir, 0, PDIR_SLOT_PTE * sizeof(pd_entry_t));
-
-	/* put in recursive PDE to map the PTEs */
-	pdir[PDIR_SLOT_PTE] = pdirpa | PG_V | PG_KW | pg_nx | pg_crypt;
+	memset(pdir, 0, PAGE_SIZE);
 
 	npde = nkptp[PTP_LEVELS - 1];
 
@@ -1332,16 +1338,15 @@ pmap_pdp_ctor(pd_entry_t *pdir)
 	memcpy(&pdir[PDIR_SLOT_KERN], &PDP_BASE[PDIR_SLOT_KERN],
 	    npde * sizeof(pd_entry_t));
 
-	/* zero the rest */
-	memset(&pdir[PDIR_SLOT_KERN + npde], 0,
-	    (NTOPLEVEL_PDES - (PDIR_SLOT_KERN + npde)) * sizeof(pd_entry_t));
-
 	for (i = 0; i < DIRECT_MAP_RESERVED_PML4_SLOTS; i++)
 		pdir[PDIR_SLOT_DIRECT + i] = kpm->pm_pdir[PDIR_SLOT_DIRECT + i];
 
 #if VM_MIN_KERNEL_ADDRESS != KERNBASE
 	pdir[pl4_pi(KERNBASE)] = PDP_BASE[pl4_pi(KERNBASE)];
 #endif
+
+	/* Each pmap's recursive entry points to its own root. */
+	pdir[PDIR_SLOT_PTE] = pdirpa | PG_V | PG_KW | pg_nx | pg_crypt;
 }
 
 void
@@ -1895,11 +1900,6 @@ pmap_do_remove(struct pmap *pmap, vaddr_t sva, vaddr_t eva, int flags)
 		 * directory page (PDP) before we are finished using
 		 * it when we hit it in the recursive mapping.  this
 		 * is BAD.
-		 *
-		 * long term solution is to move the PTEs out of user
-		 * address space.  and into kernel address space (up
-		 * with APTE).  then we can set VM_MAXUSER_ADDRESS to
-		 * be VM_MAX_ADDRESS.
 		 */
 
 		if (pl_i(va, PTP_LEVELS) == PDIR_SLOT_PTE)
@@ -2191,11 +2191,6 @@ pmap_write_protect(struct pmap *pmap, vaddr_t sva, vaddr_t eva, vm_prot_t prot)
 
 		/*
 		 * XXXCDC: our PTE mappings should never be write-protected!
-		 *
-		 * long term solution is to move the PTEs out of user
-		 * address space.  and into kernel address space (up
-		 * with APTE).  then we can set VM_MAXUSER_ADDRESS to
-		 * be VM_MAX_ADDRESS.
 		 */
 
 		/* XXXCDC: ugly hack to avoid freeing PDP here */

@@ -81,6 +81,7 @@ int user_proc;
 struct nlist nl[] = {
 	{ "_proc0paddr" },
 	{ "_pmap_direct_base" },
+	{ "_pmap_pte_slot" },
 	{ NULL }
 };
 
@@ -108,6 +109,7 @@ const char * const ptname[] = {
 };
 
 vaddr_t pmap_direct_base;
+int pmap_pte_slot;
 
 /* Not currently used */
 const pd_entry_t ign_normal[] = {
@@ -141,7 +143,8 @@ enum l4_type { T_NORMAL = 0, T_DIRECT, T_PTE, T_KERNBASE, };
 static inline enum l4_type
 l4type(int i)
 {
-	if (i >= L4_SLOT_DIRECT && i < L4_SLOT_DIRECT + DIRECT_MAP_PML4_SLOTS)
+	if (i >= pl4_pi(pmap_direct_base) &&
+	    i < pl4_pi(pmap_direct_base) + DIRECT_MAP_PML4_SLOTS)
 		return T_DIRECT;
 	if (i == L4_SLOT_PTE)
 		return T_PTE;
@@ -289,16 +292,23 @@ main(int argc, char **argv)
 	if (k == NULL)
 		return 1;
 
+	if (kvm_nlist(k, nl) != 0)
+		err(1, "nlist");
+	KGET(nl[1].n_value, pmap_direct_base);
+	KGET(nl[2].n_value, pmap_pte_slot);
+	if (pmap_pte_slot < PTE_SLOT_MIN ||
+	    pmap_pte_slot >= PTE_SLOT_MIN + PTE_SLOT_CHOICES)
+		errx(1, "invalid recursive slot: %d", pmap_pte_slot);
+
 	if (user_proc) {
 		int cnt;
 		struct kinfo_proc *kp = kvm_getprocs(k, KERN_PROC_PID, 1,
 			sizeof *kp, &cnt);
+		if (kp == NULL || cnt != 1)
+			errx(1, "cannot find PID 1: %s", kvm_geterr(k));
 		paddr = kp->p_addr;
 	} else {
-		if (kvm_nlist(k, nl) != 0)
-			err(1, "nlist");
 		KGET(nl[0].n_value, paddr);
-		KGET(nl[1].n_value, pmap_direct_base);
 	}
 
 	KGET(paddr, pcb);

@@ -149,7 +149,8 @@ export	PG_PS
 export	PGK_VALUE
 
 # pmap constants
-export	PDIR_SLOT_PTE
+export	PTE_SLOT_MIN
+export	PTE_SLOT_MASK
 
 export	NKL4_KIMG_ENTRIES
 export	NKL3_KIMG_ENTRIES

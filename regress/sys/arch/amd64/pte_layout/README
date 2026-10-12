@@ -1,0 +1,33 @@
+Recursive PTE layout regression
+==============================
+
+Build and run with updated machine headers on OpenBSD/amd64:
+
+    make obj
+    make regress
+
+This unprivileged test checks every input byte, canonical recursive
+addresses, recursive indexing through all four levels, and separation
+from kernel VM, the kernel image, the early mapping, and all direct-map
+placements.  It does not exercise the MMU or validate a running kernel.
+
+Full runtime acceptance checklist
+
+* Build and boot GENERIC, GENERIC.MP, and RAMDISK from the changed tree.
+* Boot the same kernel image repeatedly, without KARL replacing it, and
+  record pmap_pte_slot.  For endpoint test builds only, replace the seed
+  load/mask in locore0.S with an immediate 0 or 127 before PTE_SLOT_MIN
+  is added.  Changing the initial value of pmap_pte_rand in C does not
+  force a slot: the loader overwrites .openbsd.randomdata.
+* With kern.allowkmem enabled, build the sibling dump_tables utility
+  against the updated headers.  Inspect -4, -4u, -4m, and -4um output.
+  Normal kernel/process roots must have exactly one self-reference at
+  the selected slot, pointing at their own physical root; slot 255 must
+  be empty.  Meltdown user roots must have no recursive entry.  The -m
+  variants require a CPU/configuration using that mitigation.
+* Exercise fork/exec, copy-on-write, mmap/mprotect/munmap, and SMP page
+  table reclamation with PCID enabled and disabled.  Measure shootdown
+  cost: recursive addresses now use the existing upper-half invalidation
+  path, including kernel, process, and temporary PCIDs on all CPUs.
+* Test suspend/resume, hibernate, and crash-dump address translation.
+

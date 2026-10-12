@@ -664,8 +664,12 @@ store_pte:
 	movl	$NDML3_ENTRIES, %ecx
 	fillkpt_nx
 
-	/* Install recursive top level PDE */
-	leal	(PROC0_PML4_OFF + PDIR_SLOT_PTE*8)(%esi),%ebx
+	/* Select and install the only recursive top level PDE. */
+	movzbl	RELOC(pmap_pte_rand), %eax
+	andl	$PTE_SLOT_MASK, %eax
+	addl	$PTE_SLOT_MIN, %eax
+	movl	%eax, RELOC(pmap_pte_slot)
+	leal	(PROC0_PML4_OFF)(%esi,%eax,8),%ebx
 	leal	(PROC0_PML4_OFF)(%esi),%eax
 	orl	$(PG_V|PG_KW),%eax
 	movl	%eax,(%ebx)
