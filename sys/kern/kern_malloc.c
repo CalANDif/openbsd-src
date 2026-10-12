@@ -122,6 +122,62 @@ struct kmem_freelist {
 	XSIMPLEQ_ENTRY(kmem_freelist) kf_flist;
 };
 
+/* All state below is protected by malloc_mtx, including during bootstrap. */
+static u_long malloc_freecount[MINBUCKET + 16];
+static struct kmem_freelist *malloc_cache[MINBUCKET + 16][16];
+static u_int malloc_cached[MINBUCKET + 16];
+static uint8_t malloc_randbuf[256];
+static u_int malloc_randleft;
+
+/* Uniform selection from a bounded prefix, with amortized RNG locking. */
+static u_int
+malloc_random(u_int bound)
+{
+	u_int r, minimum;
+
+	MUTEX_ASSERT_LOCKED(&malloc_mtx);
+	KASSERT(bound > 0 && bound <= 16);
+	if (bound == 1)
+		return 0;
+	/* A full selection window needs neither division nor rejection. */
+	minimum = bound == 16 ? 0 : 256 % bound;
+	do {
+		if (malloc_randleft == 0) {
+			arc4random_buf(malloc_randbuf, sizeof(malloc_randbuf));
+			malloc_randleft = sizeof(malloc_randbuf);
+		}
+		r = malloc_randbuf[--malloc_randleft];
+		malloc_randbuf[malloc_randleft] = 0;
+	} while (r < minimum);
+	return bound == 16 ? r & 15 : r % bound;
+}
+
+static struct kmem_freelist *
+malloc_freelist_get(struct kmembuckets *kbp, u_int indx)
+{
+	struct kmem_freelist *fp;
+	struct kmem_freelist **cache = malloc_cache[indx];
+	u_int *cached = &malloc_cached[indx];
+	u_int n;
+
+	/*
+	 * Keep the selection window in an array, avoiding a dependent pointer
+	 * walk for every allocation.  Replenish from the queue (normally one
+	 * item), and retain its pointer encoding for cached free objects.
+	 */
+	while (*cached < nitems(malloc_cache[indx]) &&
+	    (fp = XSIMPLEQ_FIRST(&kbp->kb_freelist)) != NULL) {
+		XSIMPLEQ_REMOVE_HEAD(&kbp->kb_freelist, kf_flist);
+		cache[(*cached)++] = XSIMPLEQ_XOR(&kbp->kb_freelist, fp);
+	}
+	n = malloc_random(*cached);
+	fp = XSIMPLEQ_XOR(&kbp->kb_freelist, cache[n]);
+	cache[n] = cache[--(*cached)];
+	cache[*cached] = NULL;
+	malloc_freecount[indx]--;
+	return fp;
+}
+
 #ifdef DIAGNOSTIC
 /*
  * This structure provides a set of masks to catch unaligned frees.
@@ -156,6 +212,7 @@ malloc(size_t size, int type, int flags)
 #ifdef DIAGNOSTIC
 	int freshalloc;
 	char *savedtype;
+	caddr_t freshstart = NULL, freshend = NULL;
 #endif
 #ifdef KMEMSTATS
 	struct kmemstats *ksp = &kmemstats[type];
@@ -214,7 +271,9 @@ malloc(size_t size, int type, int flags)
 	ksp->ks_memuse += allocsize; /* account for this early */
 	ksp->ks_size |= 1 << indx;
 #endif
-	if (XSIMPLEQ_FIRST(&kbp->kb_freelist) == NULL) {
+	if (malloc_freecount[indx] == 0
+	    || (allocsize >= PAGE_SIZE && allocsize <= MAXALLOCSAVE &&
+	    malloc_freecount[indx] < 16)) {
 		mtx_leave(&malloc_mtx);
 		npg = atop(round_page(allocsize));
 		KASSERT(atomic_load_sint(&uvmexp.swpgonly) <=
@@ -226,6 +285,32 @@ malloc(size_t size, int type, int flags)
 		else
 			kdp = &kd_waitok;
 		s = splvm();
+		/*
+		 * Maintain choices even for serial page-sized allocate/free.
+		 * Refill opportunistically in batches, without waiting for the
+		 * extra pages.  On failure use an existing item, or fall back
+		 * to the original single-object allocation and wait policy.
+		 */
+		if (allocsize >= PAGE_SIZE && allocsize <= MAXALLOCSAVE) {
+			va = km_alloc(ptoa(npg * 16), &kv_intrsafe, &kp_dirty,
+			    &kd_nowait);
+			if (va != NULL)
+				npg *= 16;
+			else {
+				splx(s);
+				mtx_enter(&malloc_mtx);
+				if (malloc_freecount[indx] != 0) {
+#ifdef DIAGNOSTIC
+					freshalloc = 0;
+#endif
+					goto have_freelist;
+				}
+				mtx_leave(&malloc_mtx);
+				s = splvm();
+				va = km_alloc(ptoa(npg), &kv_intrsafe,
+				    &kp_dirty, kdp);
+			}
+		} else
 		va = (caddr_t)km_alloc(ptoa(npg), &kv_intrsafe, &kp_dirty, kdp);
 		splx(s);
 		if (va == NULL) {
@@ -253,20 +338,31 @@ malloc(size_t size, int type, int flags)
 		}
 		mtx_enter(&malloc_mtx);
 #ifdef KMEMSTATS
-		kbp->kb_total += kbp->kb_elmpercl;
+		kbp->kb_total += allocsize > MAXALLOCSAVE ? 1 :
+		    npg * PAGE_SIZE / allocsize;
 #endif
 		kup = btokup(va);
 		kup->ku_indx = indx;
 #ifdef DIAGNOSTIC
 		freshalloc = 1;
+		freshstart = va;
+		freshend = va + npg * PAGE_SIZE;
 #endif
 		if (allocsize > MAXALLOCSAVE) {
 			kup->ku_pagecnt = npg;
 			goto out;
 		}
+		/* Each page/large bucket object needs its own usage record. */
+		for (cp = va; cp < va + npg * PAGE_SIZE;
+		    cp += MAX(PAGE_SIZE, allocsize)) {
+			kup = btokup(cp);
+			kup->ku_indx = indx;
 #ifdef KMEMSTATS
-		kup->ku_freecnt = kbp->kb_elmpercl;
-		kbp->kb_totalfree += kbp->kb_elmpercl;
+			kup->ku_freecnt = kbp->kb_elmpercl;
+#endif
+		}
+#ifdef KMEMSTATS
+		kbp->kb_totalfree += npg * PAGE_SIZE / allocsize;
 #endif
 		cp = va + (npg * PAGE_SIZE) - allocsize;
 		for (;;) {
@@ -285,25 +381,43 @@ malloc(size_t size, int type, int flags)
 				break;
 			cp -= allocsize;
 		}
+		malloc_freecount[indx] += npg * PAGE_SIZE / allocsize;
 	} else {
 #ifdef DIAGNOSTIC
 		freshalloc = 0;
 #endif
 	}
-	freep = XSIMPLEQ_FIRST(&kbp->kb_freelist);
-	XSIMPLEQ_REMOVE_HEAD(&kbp->kb_freelist, kf_flist);
+have_freelist:
+	freep = malloc_freelist_get(kbp, indx);
 	va = (caddr_t)freep;
 #ifdef DIAGNOSTIC
+	/* A concurrent refill can leave older items in the sampled prefix. */
+	freshalloc = freshalloc && va >= freshstart && va < freshend;
 	savedtype = (unsigned)freep->kf_type < M_LAST ?
 		memname[freep->kf_type] : "???";
 	if (freshalloc == 0 && XSIMPLEQ_FIRST(&kbp->kb_freelist)) {
 		int rv;
 		vaddr_t addr = (vaddr_t)XSIMPLEQ_FIRST(&kbp->kb_freelist);
 
-		vm_map_lock(kmem_map);
-		rv = uvm_map_checkprot(kmem_map, addr,
-		    addr + sizeof(struct kmem_freelist), PROT_WRITE);
-		vm_map_unlock(kmem_map);
+		/*
+		 * Cached malloc pages stay mapped read/write for their entire
+		 * lifetime.  Their usage records are set after km_alloc() and
+		 * never cleared or reused.  Recognize aligned page-sized
+		 * objects here without taking the map lock under malloc_mtx.
+		 * Keep the map check for all other addresses.  If cached pages
+		 * are ever reclaimed, this shortcut must be revisited.
+		 */
+		if (allocsize >= PAGE_SIZE && allocsize <= MAXALLOCSAVE &&
+		    (addr & PAGE_MASK) == 0 &&
+		    addr >= (vaddr_t)kmembase && addr < (vaddr_t)kmemlimit &&
+		    btokup((void *)addr)->ku_indx == indx)
+			rv = 1;
+		else {
+			vm_map_lock(kmem_map);
+			rv = uvm_map_checkprot(kmem_map, addr,
+			    addr + sizeof(struct kmem_freelist), PROT_WRITE);
+			vm_map_unlock(kmem_map);
+		}
 
 		if (!rv)  {
 			printf("%s %zd of object %p size 0x%lx %s %s"
@@ -455,6 +569,14 @@ free(void *addr, int type, size_t freedsize)
 	 */
 	if (freep->kf_spare0 == poison_value(freep)) {
 		struct kmem_freelist *fp;
+		u_int i;
+
+		for (i = 0; i < malloc_cached[kup->ku_indx]; i++) {
+			fp = XSIMPLEQ_XOR(&kbp->kb_freelist,
+			    malloc_cache[kup->ku_indx][i]);
+			if (addr == fp)
+				panic("free: duplicated cached free %p", addr);
+		}
 		XSIMPLEQ_FOREACH(fp, &kbp->kb_freelist, kf_flist) {
 			if (addr != fp)
 				continue;
@@ -488,6 +610,7 @@ free(void *addr, int type, size_t freedsize)
 	ksp->ks_inuse--;
 #endif
 	XSIMPLEQ_INSERT_TAIL(&kbp->kb_freelist, freep, kf_flist);
+	malloc_freecount[kup->ku_indx]++;
 	mtx_leave(&malloc_mtx);
 #ifdef KMEMSTATS
 	if (wake)

@@ -709,6 +709,22 @@ const struct uvm_addr_functions uaddr_kernel_functions = {
 };
 
 /*
+ * Randomize within a bounded window of an already validated interval.
+ * The unused prefix remains available; no physical pages are wasted.
+ * Both endpoints have the requested alignment and offset.  Keep this
+ * allocation-free: the bootloader seeds arc4random before UVM starts.
+ */
+static vaddr_t
+uaddr_kernel_random(vaddr_t min, vaddr_t max, vaddr_t align, vsize_t window)
+{
+	u_int slots;
+
+	align = MAX(align, PAGE_SIZE);
+	slots = MIN(max - min, window) / align + 1;
+	return min + (vaddr_t)arc4random_uniform(slots) * align;
+}
+
+/*
  * Select an address from the map.
  *
  * This function ignores the uaddr spec and instead uses the map directly.
@@ -726,8 +742,12 @@ uaddr_kbootstrap_select(struct vm_map *map, struct uvm_addr_state *uaddr,
 		if (VMMAP_FREE_END(*entry_out) <= uvm_maxkaddr &&
 		    uvm_addr_fitspace(addr_out, &tmp,
 		    VMMAP_FREE_START(*entry_out), VMMAP_FREE_END(*entry_out),
-		    sz, align, offset, 0, 0) == 0)
+		    sz, align, offset, 0, 0) == 0) {
+			/* Also randomizes the initial malloc submap base. */
+			*addr_out = uaddr_kernel_random(*addr_out, tmp, align,
+			    16 * 1024 * 1024);
 			return 0;
+		}
 	}
 
 	return ENOMEM;
@@ -811,6 +831,9 @@ uaddr_bestfit_select(struct vm_map *map, struct uvm_addr_state *uaddr_p,
 	struct uaddr_bestfit_state	*uaddr;
 	struct vm_map_entry		*entry;
 	vsize_t				 guardsz;
+	struct vm_map_entry		*choices[8], *next;
+	vaddr_t				 lows[8], highs[8];
+	u_int				 n, i, tries;
 
 	uaddr = (struct uaddr_bestfit_state *)uaddr_p;
 	guardsz = ((map->flags & VM_MAP_GUARDPAGES) ? PAGE_SIZE : 0);
@@ -837,12 +860,30 @@ uaddr_bestfit_select(struct vm_map *map, struct uvm_addr_state *uaddr_p,
 	}
 
 	/*
-	 * Return the address that generates the least fragmentation.
+	 * Keep the best-fit search, but sample up to eight nearby
+	 * holes and randomize placement within 64 pages of the low end.
+	 * Bound both extra search work and excess hole size.  Always retain
+	 * the original fitting entry, even under address-space pressure.
 	 */
-	*entry_out = entry;
-	*addr_out = (min - VMMAP_FREE_START(entry) <=
-	    VMMAP_FREE_END(entry) - guardsz - sz - max ?
-	    min : max);
+	choices[0] = entry;
+	lows[0] = min;
+	highs[0] = max;
+	n = 1;
+	next = entry;
+	for (tries = 1; tries < nitems(choices); tries++) {
+		next = RBT_NEXT(uaddr_free_rbtree, next);
+		if (next == NULL || next->fspace - entry->fspace >
+		    64 * PAGE_SIZE)
+			break;
+		if (uvm_addr_fitspace(&lows[n], &highs[n],
+		    VMMAP_FREE_START(next), VMMAP_FREE_END(next),
+		    sz, align, offset, 0, guardsz) == 0)
+			choices[n++] = next;
+	}
+	i = arc4random_uniform(n);
+	*entry_out = choices[i];
+	*addr_out = uaddr_kernel_random(lows[i], highs[i], align,
+	    64 * PAGE_SIZE);
 	return 0;
 }
 #endif /* !SMALL_KERNEL */
