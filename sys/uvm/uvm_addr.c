@@ -709,6 +709,24 @@ const struct uvm_addr_functions uaddr_kernel_functions = {
 };
 
 /*
+ * Randomize within a bounded window of an already validated interval.
+ * The unused prefix remains available; no physical pages are wasted.
+ * Both endpoints have the requested alignment and offset.  Keep this
+ * allocation-free: the bootloader seeds arc4random before UVM starts.
+ * Only used while cold, including on SMALL_KERNEL builds that retain
+ * the bootstrap selector after initialization.
+ */
+static vaddr_t
+uaddr_kernel_random(vaddr_t min, vaddr_t max, vaddr_t align, vsize_t window)
+{
+	u_int slots;
+
+	align = MAX(align, PAGE_SIZE);
+	slots = MIN(max - min, window) / align + 1;
+	return min + (vaddr_t)arc4random_uniform(slots) * align;
+}
+
+/*
  * Select an address from the map.
  *
  * This function ignores the uaddr spec and instead uses the map directly.
@@ -726,8 +744,13 @@ uaddr_kbootstrap_select(struct vm_map *map, struct uvm_addr_state *uaddr,
 		if (VMMAP_FREE_END(*entry_out) <= uvm_maxkaddr &&
 		    uvm_addr_fitspace(addr_out, &tmp,
 		    VMMAP_FREE_START(*entry_out), VMMAP_FREE_END(*entry_out),
-		    sz, align, offset, 0, 0) == 0)
+		    sz, align, offset, 0, 0) == 0) {
+			/* Also randomizes the initial malloc submap base. */
+			if (cold)
+				*addr_out = uaddr_kernel_random(*addr_out, tmp,
+				    align, 16 * 1024 * 1024);
 			return 0;
+		}
 	}
 
 	return ENOMEM;
